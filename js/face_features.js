@@ -21,6 +21,10 @@
     "texGlobal", "texUpper", "spotDensity", "rednessDiffuse",
     "darkBand", "contrast", "warmth",
     "brightPct", "p90luma", "lowerShine", "bandChroma",
+    // spatial / regional signals (added so a non-linear model can exploit WHERE
+    // darkness & texture sit, not just face-wide averages)
+    "upperLuma", "eyeLuma", "cheekLuma", "lowerLuma",
+    "texMid", "texLower", "edgeDensity", "chromaRowVar",
   ];
 
   function rgb2lab(r, g, b) {
@@ -84,11 +88,16 @@
     const variance = Math.max(0, sumLuma2 / n - meanLuma * meanLuma);
     const contrast = Math.sqrt(variance);
 
-    // pass 2: texture (Laplacian) global + upper band, and local dark spots.
-    // Upper band (rows 0.15–0.50 H) ≈ forehead/eye zone for a roughly centred
-    // face → wrinkle signal. Lower influence bands are captured by the global.
+    // pass 2: texture (Laplacian) global + per-region bands, local dark spots,
+    // and edge density. Bands (fractions of H) for a roughly centred face:
+    //   upper 0.15–0.50 ≈ forehead/eye (wrinkles), mid 0.45–0.68 ≈ cheek/nose,
+    //   lower 0.68–0.95 ≈ mouth/chin (nasolabial lines). A non-linear model can
+    // then tell forehead-lines from smile-lines instead of one blurred average.
     let texAcc = 0, texN = 0, texUp = 0, texUpN = 0, darkSpots = 0;
+    let texMidAcc = 0, texMidN = 0, texLowAcc = 0, texLowN = 0, edgeCount = 0;
     const upT = (H * 0.15) | 0, upB = (H * 0.5) | 0;
+    const midT = (H * 0.45) | 0, midB = (H * 0.68) | 0;
+    const lowLT = (H * 0.68) | 0, lowLB = (H * 0.95) | 0;
     for (let y = 1; y < H - 1; y++) {
       for (let x = 1; x < W - 1; x++) {
         const i = (y * W + x) * 4;
@@ -98,7 +107,10 @@
         const lap = Math.abs(4 * c - luma[(y - 1) * W + x] - luma[(y + 1) * W + x]
           - luma[y * W + (x - 1)] - luma[y * W + (x + 1)]);
         texAcc += lap; texN++;
+        if (lap > 12) edgeCount++;
         if (y >= upT && y < upB) { texUp += lap; texUpN++; }
+        if (y >= midT && y < midB) { texMidAcc += lap; texMidN++; }
+        if (y >= lowLT && y < lowLB) { texLowAcc += lap; texLowN++; }
       }
     }
 
@@ -133,6 +145,33 @@
 
     const rednessDiffuse = clamp01((meanA - 0.5 * meanB - 5) / 18);
 
+    // regional luma means (skin-only) as ratios to the whole-face mean, so they
+    // are tone-invariant: a dark under-eye band reads the same on fair or deep
+    // skin. Bands: upper 0.10–0.35 (brow), eye 0.28–0.45 (dark circles),
+    // cheek 0.45–0.65 (clarity reference), lower 0.68–0.95 (chin).
+    function bandLumaRatio(y0f, y1f) {
+      const y0 = (H * y0f) | 0, y1 = (H * y1f) | 0;
+      let s = 0, c = 0;
+      for (let y = y0; y < y1; y++) { s += rowLumaSum[y]; c += rowLumaN[y]; }
+      return c > 0 ? (s / c) / (meanLuma + 1e-3) : 1;
+    }
+    const upperLuma = bandLumaRatio(0.10, 0.35);
+    const eyeLuma = bandLumaRatio(0.28, 0.45);
+    const cheekLuma = bandLumaRatio(0.45, 0.65);
+    const lowerLuma = bandLumaRatio(0.68, 0.95);
+    // variability of per-row chroma across skin rows — uneven pigmentation /
+    // under-eye discoloration raises it vs an even complexion.
+    let cN = 0, cMean = 0, cM2 = 0;
+    for (let y = 0; y < H; y++) {
+      if (rowLumaN[y] < 3) continue;
+      const rc = rowChromaSum[y] / rowLumaN[y];
+      cN++; const dlt = rc - cMean; cMean += dlt / cN; cM2 += dlt * (rc - cMean);
+    }
+    const chromaRowVar = cN > 1 ? Math.sqrt(cM2 / cN) : 0;
+
+    // map a luma ratio (~0.7–1.2) into ~[0,1]; model standardises after.
+    const ratioNorm = (r) => clamp01((r - 0.7) / 0.55);
+
     const vec = [
       clamp01(n / total),                         // skinFrac
       clamp01(meanL / 100),                        // meanL
@@ -150,6 +189,14 @@
       clamp01(p90luma / 255),                      // p90luma
       clamp01((lowerShine / Math.max(1, lowerN)) / 0.05), // lowerShine (T-zone)
       bandChroma,                                  // bandChroma (under-eye)
+      ratioNorm(upperLuma),                        // upperLuma (brow band)
+      ratioNorm(eyeLuma),                          // eyeLuma (dark circles)
+      ratioNorm(cheekLuma),                        // cheekLuma (clarity ref)
+      ratioNorm(lowerLuma),                        // lowerLuma (chin band)
+      clamp01((texMidAcc / Math.max(1, texMidN)) / 20), // texMid (cheek smoothness)
+      clamp01((texLowAcc / Math.max(1, texLowN)) / 20), // texLower (smile lines)
+      clamp01((edgeCount / Math.max(1, texN)) / 0.15),  // edgeDensity (wrinkle lines)
+      clamp01(chromaRowVar / 6),                   // chromaRowVar (uneven tone)
     ];
     return { names: FEATURE_NAMES, vec, ok: true };
   }

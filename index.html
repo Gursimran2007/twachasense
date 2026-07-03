@@ -29,7 +29,17 @@
       <p class="tag">AI skin analysis · tuned for Indian skin tones</p>
     </div>
   </div>
-  <div id="brandBadge" class="brand-badge">White-label demo</div>
+  <div class="topbar-right">
+    <div id="brandBadge" class="brand-badge">White-label demo</div>
+    <button id="btnCart" class="cart-btn" aria-label="Open cart">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M3 4h2l2.4 11.2a1.5 1.5 0 0 0 1.5 1.2h7.7a1.5 1.5 0 0 0 1.5-1.15L21 8H6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="9.5" cy="20" r="1.4" fill="currentColor"/>
+        <circle cx="17.5" cy="20" r="1.4" fill="currentColor"/>
+      </svg>
+      <span id="cartCount" class="cart-count" hidden>0</span>
+    </button>
+  </div>
 </header>
 
 <main>
@@ -79,6 +89,13 @@
         </svg>
         <span>Seed the baseline or train the model below to unlock condition screening.</span>
       </div>
+      <div id="referNudge" class="refer-nudge" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M12 3 3 20h18L12 3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+          <path d="M12 10v4M12 17h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+        <span id="referTxt"></span>
+      </div>
 
       <h3>Recommended routine</h3>
       <div id="routine" class="routine"></div>
@@ -109,13 +126,33 @@
   <span id="tfState" class="tf-state">offline ML ready</span>
 </footer>
 
-<!-- 100% offline: skin CV + few-shot KNN classifier, no CDN / no model download -->
+<!-- CART DRAWER — assembles the order; checkout hands off to the brand's own store -->
+<div id="cartOverlay" class="cart-overlay" hidden></div>
+<aside id="cartDrawer" class="cart-drawer" hidden aria-label="Shopping cart">
+  <div class="cart-head">
+    <h3>Your cart</h3>
+    <button id="btnCartClose" class="cart-close" aria-label="Close">&times;</button>
+  </div>
+  <div id="cartItems" class="cart-items"></div>
+  <div class="cart-foot">
+    <div class="cart-total"><span>Total</span><b id="cartTotal">—</b></div>
+    <button id="btnCheckout" class="btn primary cart-checkout" disabled>Checkout on brand store</button>
+    <p class="cart-note">Payment is handled on the brand's own secure checkout — TwachaSense never processes cards.</p>
+  </div>
+</aside>
+
+<!-- 100% offline core; brand.js/cart.js are the ONLY optional online layer -->
 <script src="js/skin_metrics.js"></script>
-<script src="js/face_features.js"></script>
-<script src="js/real_models.js"></script>
-<script src="js/recommend.js"></script>
+<script src="js/face_features.js?v=24"></script>
+<script src="js/real_models.js?v=24"></script>
+<script src="js/cond_features.js?v=cond2"></script>
+<script src="js/cond_models.js?v=cond2"></script>
+<script src="js/brand.js?v=cart2"></script>
+<script src="js/cart.js?v=cart2"></script>
+<script src="js/brand_catalog.js?v=cart2"></script>
+<script src="js/recommend.js?v=cart2"></script>
 <script src="js/classifier.js"></script>
 <script src="js/seed.js"></script>
-<script src="js/app.js"></script>
+<script src="js/app.js?v=cart2"></script>
 </body>
 </html>

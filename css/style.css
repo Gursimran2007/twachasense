@@ -5,6 +5,8 @@
   --radius:16px;
 }
 *{box-sizing:border-box}
+/* the hidden attribute must win over any display:flex/grid set on a component */
+[hidden]{display:none !important}
 body{
   margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
   background:radial-gradient(1200px 600px at 80% -10%,#20232e,transparent),var(--bg);
@@ -23,6 +25,18 @@ h1,h2,h3{margin:0}
 .brand-badge{
   font-size:12px;color:var(--accent2);border:1px solid var(--accent2);
   padding:5px 11px;border-radius:999px;opacity:.85;
+}
+.topbar-right{display:flex;align-items:center;gap:14px}
+.cart-btn{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:42px;height:42px;border:1px solid var(--line);background:var(--panel2);
+  color:var(--txt);border-radius:12px;cursor:pointer;transition:.15s;
+}
+.cart-btn:hover{border-color:var(--accent2);color:#fff;background:#232834}
+.cart-count{
+  position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;
+  background:var(--accent);color:#1a1016;font-size:11px;font-weight:700;
+  border-radius:999px;display:flex;align-items:center;justify-content:center;
 }
 main{
   display:grid;grid-template-columns:1fr 1fr;gap:20px;
@@ -93,6 +107,15 @@ main{
 .cond-list li{display:flex;justify-content:space-between;padding:3px 0}
 .ml-tag{font-weight:400;color:var(--muted);font-size:11px;text-transform:none;letter-spacing:0;margin-left:8px}
 
+/* non-diagnostic derm-referral nudge — warm amber, calm not alarming */
+.refer-nudge{
+  display:flex;align-items:flex-start;gap:10px;margin-top:10px;padding:12px 14px;
+  background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.35);
+  border-radius:10px;color:#fbbf24;font-size:13px;line-height:1.5;
+}
+.refer-nudge svg{flex:0 0 auto;margin-top:1px}
+.refer-nudge span{color:#f5e4bf}
+
 .routine{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:6px}
 /* min-width:0 lets grid cells shrink so long product names wrap instead of
    overflowing the panel's bottom-right corner. */
@@ -115,4 +138,82 @@ footer{
   display:flex;justify-content:space-between;padding:16px 26px;
   border-top:1px solid var(--line);color:var(--muted);font-size:12px;margin-top:10px;
 }
+/* ---- prominent condition callout (Part a: surface acne/disease clearly) ---- */
+.condition.flagged{
+  border-left:4px solid var(--warn);
+}
+.condition.flagged.sev-high{border-left-color:var(--bad);background:rgba(248,113,113,.06)}
+.condition.flagged.sev-mod{border-left-color:var(--warn);background:rgba(251,191,36,.06)}
+.condition.flagged.sev-low{border-left-color:var(--accent2);background:rgba(124,156,255,.05)}
+.condition.clear{border-left:4px solid var(--good)}
+.cond-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.cond-badge{
+  font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+  padding:4px 10px;border-radius:999px;white-space:nowrap;
+}
+.cond-badge.sev-high{background:rgba(248,113,113,.18);color:#fca5a5;border:1px solid #f8717155}
+.cond-badge.sev-mod{background:rgba(251,191,36,.16);color:#fbbf24;border:1px solid #fbbf2455}
+.cond-badge.sev-low{background:rgba(124,156,255,.16);color:#a5b4ff;border:1px solid #7c9cff55}
+.cond-badge.clear{background:rgba(74,222,128,.14);color:#4ade80;border:1px solid #4ade8055}
+.cond-callout{margin:8px 0 4px;font-size:14px;font-weight:600;color:var(--txt)}
+
+/* ---- connect-a-brand panel ---- */
+.panel.connect{grid-column:1 / -1}
+.brand-status{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  background:rgba(74,222,128,.08);border:1px solid #4ade8044;border-radius:10px;
+  padding:12px 14px;font-size:14px;
+}
+.brand-form{display:flex;flex-direction:column;gap:12px}
+.brand-mode-row{display:flex;gap:18px;flex-wrap:wrap}
+.brand-mode{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer}
+.brand-mode input{accent-color:var(--accent)}
+.brand-input{
+  background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  color:var(--txt);padding:11px 14px;font-size:14px;font-family:inherit;width:100%;
+}
+.brand-input:focus{outline:none;border-color:var(--accent2)}
+.brand-textarea{min-height:96px;resize:vertical;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.btn-sm{padding:6px 12px;font-size:13px}
+
+/* ---- add-to-cart on routine lines ---- */
+.rx-line{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.rx-name{min-width:0}
+.add-cart{
+  flex:0 0 auto;border:1px solid var(--accent2);background:transparent;color:var(--accent2);
+  font-size:12px;font-weight:600;padding:5px 10px;border-radius:8px;cursor:pointer;
+  white-space:nowrap;transition:.15s;
+}
+.add-cart:hover{background:var(--accent2);color:#0f1115}
+
+/* ---- cart drawer ---- */
+.cart-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:40}
+.cart-drawer{
+  position:fixed;top:0;right:0;width:380px;max-width:92vw;height:100vh;z-index:41;
+  background:var(--panel);border-left:1px solid var(--line);
+  display:flex;flex-direction:column;box-shadow:-12px 0 40px rgba(0,0,0,.4);
+}
+.cart-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--line)}
+.cart-head h3{font-size:17px}
+.cart-close{background:none;border:none;color:var(--muted);font-size:26px;line-height:1;cursor:pointer}
+.cart-close:hover{color:var(--txt)}
+.cart-items{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}
+.cart-empty{color:var(--muted);text-align:center;margin-top:40px;font-size:14px}
+.cart-item{display:flex;gap:12px}
+.ci-img{width:56px;height:56px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:var(--panel2)}
+.ci-noimg{border:1px solid var(--line)}
+.ci-body{flex:1;min-width:0}
+.ci-title{font-size:14px;font-weight:600;line-height:1.3;overflow-wrap:anywhere}
+.ci-price{color:var(--muted);font-size:13px;margin:2px 0 6px}
+.ci-qty{display:flex;align-items:center;gap:8px;font-size:13px}
+.qtybtn{width:24px;height:24px;border:1px solid var(--line);background:var(--panel2);color:var(--txt);border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
+.qtybtn:hover{border-color:var(--accent2)}
+.ci-remove{margin-left:auto;background:none;border:none;color:var(--muted);font-size:12px;cursor:pointer;text-decoration:underline}
+.ci-remove:hover{color:var(--bad)}
+.cart-foot{padding:18px 20px;border-top:1px solid var(--line)}
+.cart-total{display:flex;justify-content:space-between;align-items:center;font-size:15px;margin-bottom:12px}
+.cart-total b{font-size:18px}
+.cart-checkout{width:100%}
+.cart-note{color:var(--muted);font-size:11px;line-height:1.5;margin:10px 0 0;text-align:center}
+
 @media(max-width:820px){main{grid-template-columns:1fr}.routine{grid-template-columns:1fr}}

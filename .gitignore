@@ -19,3 +19,4 @@ train/tfjs_model/
 
 # Local training data (real photos are never committed — only learned weights are)
 _ds/
+_ds_cond/

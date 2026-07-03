@@ -147,6 +147,6 @@
 
   global.Classifier = {
     CLASSES, init, addExample, predict, counts, totalExamples,
-    isTrained, reset, get ready() { return ready; },
+    isTrained, reset, featurize, get ready() { return ready; },
   };
 })(window);

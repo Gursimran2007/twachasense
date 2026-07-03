@@ -82,7 +82,12 @@
     picks.forEach((k) => {
       const meta = INGREDIENT[k];
       const cat = (catalog.ingredients[k]) || { product: k, url: "#" };
-      const item = { key: k, note: meta.note, product: cat.product, url: cat.url };
+      const item = {
+        key: k, note: meta.note, product: cat.product, url: cat.url,
+        // live-brand fields (present only when a real catalog is connected)
+        price: cat.price != null ? cat.price : null,
+        image: cat.image || null, id: cat.id || null, variantId: cat.variantId || null,
+      };
       (meta.when === "PM" ? pm : am).push(item);
     });
     // ensure cleanser first, spf last in AM

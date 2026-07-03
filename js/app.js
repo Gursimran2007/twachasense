@@ -73,7 +73,16 @@
   }
 
   // ---- analysis ------------------------------------------------------------
-  let lastProfile = null, lastCondition = null, lastPlan = null, lastReal = null;
+  let lastProfile = null, lastCondition = null, lastPlan = null, lastReal = null, lastRefer = null;
+
+  // adapt CondModels.score() -> the {label, confidence, confidences} shape the
+  // KNN classifier and the recommender already speak (confidences are 0..1).
+  function condFromReal(r) {
+    if (!r) return null;
+    const confidences = {};
+    Object.keys(r.probs).forEach((k) => (confidences[k] = r.probs[k] / 100));
+    return { label: r.label, confidence: r.confidence, confidences, source: "real" };
+  }
 
   async function analyse() {
     if (!lastPatch) return;
@@ -82,12 +91,25 @@
     if (!profile.ok) { $("empty").hidden = false; $("report").hidden = true; $("empty").textContent = profile.reason; return; }
 
     lastProfile = profile;
-    lastCondition = Classifier.isTrained() ? await Classifier.predict(lastPatch) : null;
+    // real-data condition model (trained on ~11k real derm photos) + non-diagnostic
+    // derm-referral head. Always available — no seeding needed.
+    const realCond = (window.CondModels && lastPatch) ? CondModels.score(lastPatch) : null;
+    lastRefer = realCond;
+    // If the brand has taught the few-shot KNN on its own photos, that personalised
+    // signal wins; otherwise fall back to the shipped real-data model.
+    lastCondition = Classifier.isTrained()
+      ? await Classifier.predict(lastPatch)
+      : condFromReal(realCond);
     // real-data face-level estimates from the whole photo (may be null on a
     // tight crop with too little skin — the UI hides the section in that case)
     lastReal = (lastFull && window.RealModels)
       ? RealModels.score(lastFull.getContext("2d").getImageData(0, 0, 160, 160)) : null;
-    lastPlan = Recommend.build(profile, lastCondition, Recommend.SAMPLE_CATALOG);
+    // If a brand store is connected, resolve the routine against ITS real catalog
+    // (live SKUs + prices) instead of the demo catalog.
+    const catalog = (window.Brand && Brand.isConnected())
+      ? { brand: Brand.get().brand, ingredients: Brand.get().ingredients }
+      : Recommend.SAMPLE_CATALOG;
+    lastPlan = Recommend.build(profile, lastCondition, catalog);
 
     render(profile, lastCondition, lastPlan, lastReal);
   }
@@ -96,6 +118,21 @@
   // when a concern crosses a warning / critical threshold, so the eye is drawn to
   // what actually needs attention instead of a rainbow. Radiance is a POSITIVE
   // metric (higher = better skin) so it never turns "warning".
+  // plain-language callout per screened condition (what the user actually sees)
+  const CALLOUT = {
+    Acne: "Active acne / breakouts",
+    Fungal: "Fungal-type acne pattern",
+    Eczema: "Eczema-like irritation",
+    Pigmentation: "Pigmentation / dark spots",
+    Dryness: "Dry, dehydrated skin",
+  };
+  // confidence -> severity word + class for the coloured badge
+  function severityFor(conf) {
+    if (conf >= 70) return { word: "High signal", cls: "high" };
+    if (conf >= 45) return { word: "Moderate", cls: "mod" };
+    return { word: "Mild", cls: "low" };
+  }
+
   const BAR_BRAND = "#8b93f8", BAR_WARN = "#fbbf24", BAR_CRIT = "#fb7185";
   function barColor(key, v) {
     if (key === "Radiance") return BAR_BRAND;   // high radiance is good, never a warning
@@ -146,18 +183,33 @@
       $("realBars").previousElementSibling.style.display = "none";
     }
 
-    // condition
+    // condition — a detected concern (anything other than "Clear") is surfaced
+    // PROMINENTLY: a coloured severity badge + a plain callout of what was seen,
+    // so acne / fungal / eczema / pigmentation don't hide in a faint list.
     const co = $("conditionOut");
     if (cond) {
       const others = Object.entries(cond.confidences)
         .filter(([k]) => k !== cond.label)
         .sort((a, b) => b[1] - a[1]).slice(0, 3)
         .map(([k, v]) => `<li><span>${k}</span><span>${Math.round(v * 100)}%</span></li>`).join("");
-      co.className = "condition";
+      const detected = cond.label && cond.label !== "Clear";
+      const sev = severityFor(cond.confidence);   // {word,cls}
+      co.className = detected ? "condition flagged sev-" + sev.cls : "condition clear";
+      const badge = detected
+        ? `<span class="cond-badge sev-${sev.cls}">${sev.word}</span>`
+        : `<span class="cond-badge clear">Looks clear</span>`;
+      const headline = detected
+        ? `${CALLOUT[cond.label] || cond.label} detected`
+        : `No cosmetic concern flagged`;
       co.innerHTML =
-        `<div class="cond-top">${cond.label} · ${cond.confidence}%</div>
+        `<div class="cond-head">
+           <div class="cond-top">${cond.label} · ${cond.confidence}%</div>${badge}
+         </div>
+         <p class="cond-callout">${headline}</p>
          <ul class="cond-list">${others}</ul>`;
-      $("mlState").textContent = `model: ${Classifier.totalExamples()} examples`;
+      $("mlState").textContent = cond.source === "real"
+        ? "real model · ~11k derm photos"
+        : `model: ${Classifier.totalExamples()} examples (personalised)`;
     } else {
       co.className = "condition locked";
       co.innerHTML =
@@ -169,11 +221,37 @@
       $("mlState").textContent = "model: not trained";
     }
 
-    // routine
+    // NON-DIAGNOSTIC derm-referral nudge. The binary head (AUC ~0.70) fires when
+    // the skin pattern looks unlike ordinary cosmetic concerns. It NEVER names a
+    // disease — it only suggests a professional look. Shown above ~55% to keep it
+    // a genuine signal, not a blanket disclaimer.
+    const nudge = $("referNudge");
+    if (nudge) {
+      if (lastRefer && lastRefer.refer >= 55) {
+        $("referTxt").textContent =
+          "This skin pattern looks different from ordinary cosmetic concerns. " +
+          "This is a cosmetic screen, not a diagnosis — consider having it looked at by a dermatologist.";
+        nudge.hidden = false;
+      } else {
+        nudge.hidden = true;
+      }
+    }
+
+    // routine — when a brand store is connected each item shows its real price
+    // and an "Add" button that drops the SKU into the cart.
+    const connected = window.Brand && Brand.isConnected();
+    const cur = connected ? (Brand.get().currency || "INR") : "INR";
     const routine = $("routine"); routine.innerHTML = "";
+    const line = (x) => {
+      const priced = connected && x.price != null && x.price > 0;
+      const buy = priced
+        ? `<button class="add-cart" data-key="${x.key}">${money(x.price, cur)} · Add</button>`
+        : "";
+      return `<li><div class="rx-line"><span class="rx-name">${x.product}
+                <span class="ing">— ${x.note}</span></span>${buy}</div></li>`;
+    };
     const mk = (title, items) => {
-      const li = items.map((x) =>
-        `<li>${x.product} <span class="ing">— ${x.note}</span></li>`).join("");
+      const li = items.map(line).join("");
       return `<div class="slot"><h4>${title}</h4><ul>${li || "<li>moisturise</li>"}</ul></div>`;
     };
     let html = mk("☀ AM", plan.am) + mk("🌙 PM", plan.pm);
@@ -182,6 +260,27 @@
                  <h4 style="color:#f87171">⚠ Caution</h4>
                  <p style="margin:0;font-size:13px;line-height:1.5">${plan.caution}</p></div>`;
     routine.innerHTML = html;
+
+    // wire the Add buttons to the cart, resolving each key back to its plan item
+    if (connected) {
+      const byKey = {};
+      plan.am.concat(plan.pm).forEach((x) => (byKey[x.key] = x));
+      routine.querySelectorAll(".add-cart").forEach((b) =>
+        b.addEventListener("click", () => {
+          const x = byKey[b.dataset.key];
+          if (!x) return;
+          Cart.add({ id: x.id, variantId: x.variantId, title: x.product,
+            price: x.price, image: x.image, url: x.url });
+          b.textContent = "Added ✓";
+          setTimeout(() => (b.textContent = money(x.price, cur) + " · Add"), 1200);
+        }));
+    }
+  }
+
+  const CURSYM = { INR: "₹", USD: "$", GBP: "£", EUR: "€" };
+  function money(v, cur) {
+    const s = CURSYM[cur] || (cur ? cur + " " : "");
+    return s + (Math.round(Number(v) * 100) / 100);
   }
 
   // ---- training UI ---------------------------------------------------------
@@ -259,7 +358,82 @@
     );
   }
 
+  // ---- brand link-up (no visible UI) ---------------------------------------
+  // A brand is linked on demand via js/brand_catalog.js (BRAND_CATALOG paste or
+  // BRAND_SHOPIFY domain). When present, the routine resolves against the brand's
+  // REAL SKUs; otherwise it stays on the neutral demo catalog. No connect panel.
+  async function autoLinkBrand() {
+    if (!window.Brand) return;
+    try {
+      if (window.BRAND_CATALOG) {
+        const s = await Brand.connect({ mode: "json", value: JSON.stringify(window.BRAND_CATALOG) });
+        $("brandBadge").textContent = s.brand;
+      } else if (window.BRAND_SHOPIFY) {
+        const s = await Brand.connect({ mode: "shopify", value: window.BRAND_SHOPIFY });
+        $("brandBadge").textContent = s.brand;
+      } else if (Brand.isConnected()) {
+        $("brandBadge").textContent = Brand.get().brand;   // restored from a prior session
+      }
+    } catch (e) { /* fall back silently to the demo catalog */ }
+    if (lastProfile) analyse();
+  }
+
+  // ---- cart ----------------------------------------------------------------
+  function openCart() { $("cartOverlay").hidden = false; $("cartDrawer").hidden = false; }
+  function closeCart() { $("cartOverlay").hidden = true; $("cartDrawer").hidden = true; }
+
+  function renderCart(items) {
+    const box = $("cartItems");
+    const cur = (window.Brand && Brand.isConnected() && Brand.get().currency) || "INR";
+    $("cartCount").textContent = Cart.count();
+    $("cartCount").hidden = Cart.count() === 0;
+    if (!items.length) {
+      box.innerHTML = `<p class="cart-empty">Cart is empty. Add products from your routine.</p>`;
+      $("cartTotal").textContent = "—";
+      $("btnCheckout").disabled = true;
+      return;
+    }
+    box.innerHTML = items.map((it) => {
+      const key = it.id || it.title;
+      const img = it.image
+        ? `<img src="${it.image}" alt="" class="ci-img" />`
+        : `<div class="ci-img ci-noimg"></div>`;
+      return `<div class="cart-item">
+        ${img}
+        <div class="ci-body">
+          <div class="ci-title">${it.title}</div>
+          <div class="ci-price">${money(it.price, cur)}</div>
+          <div class="ci-qty">
+            <button class="qtybtn" data-key="${key}" data-d="-1">–</button>
+            <span>${it.qty}</span>
+            <button class="qtybtn" data-key="${key}" data-d="1">+</button>
+            <button class="ci-remove" data-key="${key}">Remove</button>
+          </div>
+        </div></div>`;
+    }).join("");
+    $("cartTotal").textContent = money(Cart.total(), cur);
+    $("btnCheckout").disabled = false;
+    box.querySelectorAll(".qtybtn").forEach((b) => b.addEventListener("click", () => {
+      const it = Cart.all().find((x) => (x.id || x.title) === b.dataset.key);
+      if (it) Cart.setQty(b.dataset.key, it.qty + Number(b.dataset.d));
+    }));
+    box.querySelectorAll(".ci-remove").forEach((b) =>
+      b.addEventListener("click", () => Cart.remove(b.dataset.key)));
+  }
+
+  function doCheckout() {
+    const r = Cart.checkout();
+    if (!r.ok) { $("btnCheckout").textContent = r.reason; setTimeout(() => ($("btnCheckout").textContent = "Checkout on brand store"), 2200); }
+  }
+
   // ---- wire up -------------------------------------------------------------
+  $("btnCart").addEventListener("click", openCart);
+  $("btnCartClose").addEventListener("click", closeCart);
+  $("cartOverlay").addEventListener("click", closeCart);
+  $("btnCheckout").addEventListener("click", doCheckout);
+  Cart.onChange(renderCart);
+  autoLinkBrand();
+
   $("btnCam").addEventListener("click", startCam);
   $("btnSnap").addEventListener("click", snap);
   $("file").addEventListener("change", onFile);

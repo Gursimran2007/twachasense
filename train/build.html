@@ -17,8 +17,8 @@ pre{background:#181b22;padding:12px;border-radius:8px;overflow:auto;white-space:
 <h3>Paste into js/real_models.js</h3>
 <pre id="out"></pre>
 
-<script src="../js/skin_metrics.js"></script>
-<script src="../js/face_features.js"></script>
+<script src="../js/skin_metrics.js?v=24"></script>
+<script src="../js/face_features.js?v=24"></script>
 <script>
 "use strict";
 const ATTRS = ["clear","oily","dark","wrinkle"];
@@ -75,26 +75,84 @@ function standardise(X){
 
 function sigmoid(z){return 1/(1+Math.exp(-z));}
 
-// class-weighted logistic regression w/ L2, full-batch gradient descent
-function train(Z,y,{iters=400,lr=0.5,l2=1e-3}={}){
-  const n=Z.length, w=new Array(DIM).fill(0); let b=0;
-  const pos=y.reduce((s,v)=>s+v,0), neg=n-pos;
+const HID = 12;   // hidden units — enough capacity to beat the linear ceiling
+
+// small MLP: x -> tanh(W1 x + b1) -> sigmoid(W2 h + b2). Class-weighted BCE, L2.
+// Full-batch GD for small sets (<=8k rows, deterministic, reproduces the shipped
+// weights). For large sets (the 500k+ path) it auto-switches to shuffled
+// MINI-BATCH SGD so a pass costs O(batch) memory/time instead of O(n) — the same
+// architecture, just a scalable optimiser. He-ish init from a seeded RNG.
+function train(Z,y,opts={}){
+  const n=Z.length;
+  const { lr=0.6, l2=6e-4, seed=1234 } = opts;
+  const bigData = n>8000;
+  const batch = opts.batch || (bigData ? 512 : n);
+  // full-batch keeps the old "iters" update count; mini-batch counts epochs.
+  const iters = opts.iters || 900;
+  const epochs = opts.epochs || 25;
+  let s=seed>>>0; const rnd=()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};
+  const scale=Math.sqrt(2/DIM);
+  const W1=Array.from({length:HID},()=>Array.from({length:DIM},()=>(rnd()*2-1)*scale));
+  const b1=new Array(HID).fill(0);
+  const W2=Array.from({length:HID},()=>(rnd()*2-1)*Math.sqrt(1/HID));
+  let b2=0;
+  const pos=y.reduce((a,v)=>a+v,0), neg=n-pos;
   const wPos=neg/n*2, wNeg=pos/n*2;                 // balance imbalance
-  for(let it=0;it<iters;it++){
-    const gw=new Array(DIM).fill(0); let gb=0;
-    for(let i=0;i<n;i++){
-      let z=b; const zi=Z[i];
-      for(let j=0;j<DIM;j++) z+=w[j]*zi[j];
-      const p=sigmoid(z);
-      const cw = y[i]?wPos:wNeg;
-      const err=(p-y[i])*cw;
-      for(let j=0;j<DIM;j++) gw[j]+=err*zi[j];
-      gb+=err;
+  const h=new Array(HID);
+
+  // one gradient step over indices [lo,hi); m = #samples for the mean.
+  function step(order, lo, hi){
+    const m=hi-lo;
+    const gW1=Array.from({length:HID},()=>new Array(DIM).fill(0));
+    const gb1=new Array(HID).fill(0), gW2=new Array(HID).fill(0); let gb2=0;
+    for(let t=lo;t<hi;t++){
+      const i=order?order[t]:t; const xi=Z[i];
+      let z2=b2;
+      for(let k=0;k<HID;k++){
+        let a=b1[k]; const w1k=W1[k];
+        for(let j=0;j<DIM;j++) a+=w1k[j]*xi[j];
+        const hk=Math.tanh(a); h[k]=hk; z2+=W2[k]*hk;
+      }
+      const p=sigmoid(z2);
+      const cw=y[i]?wPos:wNeg;
+      const dz=(p-y[i])*cw;
+      gb2+=dz;
+      for(let k=0;k<HID;k++){
+        gW2[k]+=dz*h[k];
+        const dh=dz*W2[k]*(1-h[k]*h[k]);
+        gb1[k]+=dh; const gW1k=gW1[k];
+        for(let j=0;j<DIM;j++) gW1k[j]+=dh*xi[j];
+      }
     }
-    for(let j=0;j<DIM;j++){ w[j]-=lr*(gw[j]/n + l2*w[j]); }
-    b-=lr*(gb/n);
+    for(let k=0;k<HID;k++){
+      W2[k]-=lr*(gW2[k]/m + l2*W2[k]);
+      b1[k]-=lr*(gb1[k]/m);
+      const W1k=W1[k], gW1k=gW1[k];
+      for(let j=0;j<DIM;j++) W1k[j]-=lr*(gW1k[j]/m + l2*W1k[j]);
+    }
+    b2-=lr*(gb2/m);
   }
-  return {w,b};
+
+  if(batch>=n){                                     // full-batch (small data)
+    for(let it=0;it<iters;it++) step(null,0,n);
+  }else{                                            // mini-batch SGD (500k path)
+    const order=Array.from({length:n},(_,i)=>i);
+    for(let ep=0;ep<epochs;ep++){
+      for(let i=n-1;i>0;i--){const j=(rnd()*(i+1))|0;const tmp=order[i];order[i]=order[j];order[j]=tmp;}
+      for(let lo=0;lo<n;lo+=batch) step(order,lo,Math.min(n,lo+batch));
+    }
+  }
+  return {W1,b1,W2,b2};
+}
+
+function mlpProb(m,x){
+  let z2=m.b2;
+  for(let k=0;k<HID;k++){
+    let a=m.b1[k]; const w1k=m.W1[k];
+    for(let j=0;j<DIM;j++) a+=w1k[j]*x[j];
+    z2+=m.W2[k]*Math.tanh(a);
+  }
+  return sigmoid(z2);
 }
 
 function auc(scores,y){
@@ -108,8 +166,7 @@ function auc(scores,y){
 function evalModel(Z,y,m){
   let tp=0,tn=0,fp=0,fn=0; const sc=[];
   for(let i=0;i<Z.length;i++){
-    let z=m.b; for(let j=0;j<DIM;j++) z+=m.w[j]*Z[i][j];
-    const p=sigmoid(z); sc.push(p); const pred=p>=0.5?1:0;
+    const p=mlpProb(m,Z[i]); sc.push(p); const pred=p>=0.5?1:0;
     if(pred&&y[i])tp++; else if(!pred&&!y[i])tn++; else if(pred&&!y[i])fp++; else fn++;
   }
   const acc=(tp+tn)/Z.length;
@@ -128,15 +185,18 @@ async function run(){
   const {Z,mean,std}=standardise(X);
   const Ztr=Z.slice(0,nTr), Zte=Z.slice(nTr);
   const models={}, metrics={};
+  const r4=v=>+v.toFixed(4);
   ATTRS.forEach((a,ai)=>{
     const ytr=Y[a].slice(0,nTr), yte=Y[a].slice(nTr);
     const m=train(Ztr,ytr);
-    models[a]={w:m.w.map(v=>+v.toFixed(4)),b:+m.b.toFixed(4)};
+    models[a]={ W1:m.W1.map(row=>row.map(r4)), b1:m.b1.map(r4),
+                W2:m.W2.map(r4), b2:r4(m.b2) };
     metrics[a]={train:evalModel(Ztr,ytr,m), test:evalModel(Zte,yte,m)};
     window.__state.done=ai+1;
   });
-  const bundle={ names:FaceFeatures.FEATURE_NAMES, mean:mean.map(v=>+v.toFixed(4)),
-                 std:std.map(v=>+v.toFixed(4)), models, trainedOn:n, date:new Date().toISOString().slice(0,10) };
+  const bundle={ arch:"mlp", hidden:HID, names:FaceFeatures.FEATURE_NAMES,
+                 mean:mean.map(r4), std:std.map(r4), models, trainedOn:n,
+                 date:new Date().toISOString().slice(0,10) };
   window.__result={metrics, bundle};
   window.__state.phase="done";
   document.getElementById("metrics").textContent=JSON.stringify(metrics,null,2);

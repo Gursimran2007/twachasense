@@ -80,40 +80,73 @@ which is the real moat.
 The condition screen is synthetic; the **Real-skin estimates** row is not. Three
 attribute detectors — **Clarity**, **Dark circles**, **Wrinkles** — are trained on
 **~4,900 real Indian-face photos** (5,000 sampled; grayscale / no-skin dropped)
-with human attribute labels. The pipeline is deliberately simple and honest:
+with human attribute labels. The pipeline is deliberately honest:
 
-- A shared 16-d **face-level descriptor** (`js/face_features.js`) is computed over
-  the whole photo — skin fraction, Lab tone, oiliness/shine, global & upper-band
-  texture (wrinkles), an under-eye dark-band + chroma signal (dark circles), etc.
-  The **exact same function** runs at training time and inference time, so the
-  feature distribution can never drift between train and serve.
-- Per attribute, a **standardised, class-weighted logistic regression** (L2, full-
-  batch GD) is trained in-browser via `train/build.html` against a local `_ds/`
-  dataset. Only the learned weights ship in `js/real_models.js` — **never the
-  photos**. Inference stays 100% offline / pure-JS / no CDN.
+- A shared 24-d **face-level descriptor** (`js/face_features.js`) is computed over
+  the whole photo — skin fraction, Lab tone, oiliness/shine, texture in **four
+  regional bands** (brow / eye / cheek / chin), an under-eye dark-band + chroma
+  signal, edge density, and per-region luma ratios. The **exact same function**
+  runs at training and inference time, so the feature distribution can never
+  drift between train and serve.
+- Per attribute, a small **MLP** (24 → 12 tanh → sigmoid, class-weighted BCE, L2,
+  full-batch GD) is trained in-browser via `train/build.html` against a local
+  `_ds/` dataset. Only the learned weights ship in `js/real_models.js` — **never
+  the photos**. Inference stays 100% offline / pure-JS / no CDN.
 
-Held-out AUC on a ~970-image test split: **Clarity 0.71, Wrinkles 0.70, Dark
-circles 0.68** — honest, moderate signals surfaced as *estimates*, not diagnoses.
-Oiliness trained to ~0.57 AUC (≈ chance) so it stays the **direct CV specular
-measurement** in `skin_metrics.js` rather than a weak learned model. To retrain:
-open `train/build.html` against a local `_ds/` dataset and paste the new bundle.
+Held-out AUC on a ~970-image test split: **Clarity 0.78, Wrinkles 0.77, Dark
+circles 0.71** — honest, moderate signals surfaced as *estimates*, not diagnoses.
+The MLP + regional features lifted every attribute over the earlier linear
+logistic baseline (0.71 / 0.70 / 0.68), which was *underfitting* — the gain came
+from model capacity, not more rows. Oiliness trained to ~0.61 AUC (still weak) so
+it stays the **direct CV specular measurement** in `skin_metrics.js` rather than a
+learned model. To retrain: open `train/build.html` against a local `_ds/` dataset
+and paste the new bundle.
+
+### Real-data condition model + derm-referral nudge (`js/cond_models.js`)
+The shipped Condition screen is now a **real-data model**, not the synthetic KNN.
+Two honest heads, both fed the **shared 49-d `CondFeatures` descriptor** (finer
+HSV/Lab colour moments, texture statistics, and a **3×3 spatial grid** so the
+model sees *where* an abnormality sits — the same function runs at train and serve
+time, so features can't drift), trained on **~11k real dermatology photos**
+(`train/build_cond.html`, weights only — never the photos):
+
+- **Cosmetic 6-class softmax MLP** (Clear/Acne/Fungal/Eczema/Pigmentation/Dryness).
+  Held-out **balanced-accuracy ~0.50** (6-class chance 0.167 → ~3×). It's a
+  *screen*, surfaced as an estimate. The richer descriptor + capacity tuning
+  lifted this from **0.42 → 0.50** balanced (the reused 24-d skin vector was
+  *feature-limited* — it couldn't fit even the training set).
+- **Non-diagnostic referral head** — a binary MLP (medical vs cosmetic,
+  held-out **AUC ~0.70, recall ~0.68**) that raises a calm *"consider seeing a
+  dermatologist"* nudge when the skin pattern looks unlike ordinary cosmetic
+  concerns. It **never names a disease** — a deliberate liability/regulatory
+  choice. Recall is favoured over specificity so genuine medical patterns are
+  caught (at the cost of some over-nudging on cosmetic cases).
+
+The few-shot KNN (`js/classifier.js`) still ships: when a brand teaches it on its
+**own** labelled photos, that personalised signal takes over the Condition screen.
+To retrain the real model: open `train/build_cond.html` against a local `_ds_cond/`
+dataset and paste the new bundle.
 
 ## How it works
 
 ```
 photo ─┬─ centre ROI (224²) ─┬─▶ SkinMetrics.analyse()  → tone, undertone, scores  (offline CV)
-       │                     └─▶ 24-d skin feature vector ─▶ KNN few-shot classifier → condition (ML)
-       │                                 │   (HSV histogram + CV metrics + Lab tone, all in-browser)
-       │                                 └─▶ Recommend.build() → ranked concerns → AM/PM routine → brand SKUs
-       └─ whole photo (160²) ──▶ FaceFeatures (16-d) ─▶ real logistic detectors → Clarity / Dark circles / Wrinkles
+       │                     ├─▶ CondFeatures (49-d) ─▶ real MLPs → cosmetic condition + derm-referral nudge
+       │                     │        (colour moments + texture + 3×3 spatial grid, trained on ~11k derm photos)
+       │                     ├─▶ 24-d skin vector ─▶ KNN few-shot classifier → personalised condition (brand's own data)
+       │                     └─▶ Recommend.build() → ranked concerns → AM/PM routine → brand SKUs
+       └─ whole photo (160²) ──▶ FaceFeatures (24-d) ─▶ real MLP detectors → Clarity / Dark circles / Wrinkles
 ```
 
 | Piece | File | What |
 |---|---|---|
 | Skin CV metrics | `js/skin_metrics.js` | skin mask, Lab tone/undertone, oiliness/redness/pigment/texture/fungal-patch |
-| ML condition model | `js/classifier.js` | 24-d skin feature vector + trainable weighted KNN, saved to `localStorage` (100% offline, no CDN) |
-| Face-level features | `js/face_features.js` | 16-d whole-photo descriptor, shared by trainer + inference for train/serve parity |
-| Real-data detectors | `js/real_models.js` | logistic Clarity/Dark-circles/Wrinkles trained on ~4,900 real Indian faces (weights only) |
+| Condition descriptor | `js/cond_features.js` | 49-d condition vector (colour moments + texture + 3×3 spatial grid), shared by trainer + inference |
+| Real condition model | `js/cond_models.js` | cosmetic 6-class softmax MLP + non-diagnostic derm-referral MLP, trained on ~11k real derm photos (weights only) |
+| Condition trainer | `train/build_cond.html` | dev-only in-browser trainer over a local `_ds_cond/` dataset → paste-ready weight bundle |
+| Few-shot personaliser | `js/classifier.js` | 24-d skin feature vector + trainable weighted KNN, saved to `localStorage`; overrides the Condition screen when a brand trains on its own photos |
+| Face-level features | `js/face_features.js` | 24-d whole-photo descriptor (regional darkness/texture), shared by trainer + inference for train/serve parity |
+| Real-data detectors | `js/real_models.js` | MLP Clarity/Dark-circles/Wrinkles trained on ~4,900 real Indian faces (weights only) |
 | Detector trainer | `train/build.html` | dev-only in-browser trainer over a local `_ds/` dataset → paste-ready weight bundle |
 | D2C recommender | `js/recommend.js` | concern ranking + ingredient→brand-SKU routine, white-label catalog |
 | App / UI | `js/app.js`, `index.html`, `css/style.css` | camera, ROI, training UI, report |
