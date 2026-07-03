@@ -1,0 +1,18 @@
+# OS
+.DS_Store
+
+# Python (train/ scale-path scaffold)
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Editor
+.vscode/
+.idea/
+
+# Model export artifacts
+train/model/
+train/*.h5
+train/tfjs_model/
