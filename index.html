@@ -68,6 +68,9 @@
       <h3>Concern scores</h3>
       <div id="bars" class="bars"></div>
 
+      <h3>Real-skin estimates <span class="sub">learned from 5,000 real Indian faces</span></h3>
+      <div id="realBars" class="bars"></div>
+
       <h3>Condition screen <span class="ml-tag" id="mlState">model: not trained</span></h3>
       <div id="conditionOut" class="condition locked">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -108,6 +111,8 @@
 
 <!-- 100% offline: skin CV + few-shot KNN classifier, no CDN / no model download -->
 <script src="js/skin_metrics.js"></script>
+<script src="js/face_features.js"></script>
+<script src="js/real_models.js"></script>
 <script src="js/recommend.js"></script>
 <script src="js/classifier.js"></script>
 <script src="js/seed.js"></script>

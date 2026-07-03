@@ -8,6 +8,16 @@
   const video = $("video"), frame = $("frame"), shot = $("shot");
   let stream = null;
   let lastPatch = null;   // canvas of the analysed ROI (for training too)
+  let lastFull = null;    // 160² whole-photo canvas for the face-level real models
+
+  // Whole-photo canvas, stretched to 160² to EXACTLY match how the real-model
+  // trainer (train/build.html) rendered each image — feature parity is essential.
+  function grabFull(sourceEl, sw, sh) {
+    const c = document.createElement("canvas");
+    c.width = 160; c.height = 160;
+    c.getContext("2d", { willReadFrequently: true }).drawImage(sourceEl, 0, 0, sw, sh, 0, 0, 160, 160);
+    return c;
+  }
 
   // ---- camera --------------------------------------------------------------
   async function startCam() {
@@ -41,6 +51,7 @@
     shot.src = frame.toDataURL("image/jpeg");
     shot.hidden = false; video.hidden = true;
     lastPatch = grabPatch(frame, frame.width, frame.height);
+    lastFull = grabFull(frame, frame.width, frame.height);
     analyse();
   }
 
@@ -55,13 +66,14 @@
       shot.src = c.toDataURL("image/jpeg");
       shot.hidden = false; video.hidden = true;
       lastPatch = grabPatch(c, img.width, img.height);
+      lastFull = grabFull(c, img.width, img.height);
       analyse();
     };
     img.src = URL.createObjectURL(f);
   }
 
   // ---- analysis ------------------------------------------------------------
-  let lastProfile = null, lastCondition = null, lastPlan = null;
+  let lastProfile = null, lastCondition = null, lastPlan = null, lastReal = null;
 
   async function analyse() {
     if (!lastPatch) return;
@@ -71,9 +83,13 @@
 
     lastProfile = profile;
     lastCondition = Classifier.isTrained() ? await Classifier.predict(lastPatch) : null;
+    // real-data face-level estimates from the whole photo (may be null on a
+    // tight crop with too little skin — the UI hides the section in that case)
+    lastReal = (lastFull && window.RealModels)
+      ? RealModels.score(lastFull.getContext("2d").getImageData(0, 0, 160, 160)) : null;
     lastPlan = Recommend.build(profile, lastCondition, Recommend.SAMPLE_CATALOG);
 
-    render(profile, lastCondition, lastPlan);
+    render(profile, lastCondition, lastPlan, lastReal);
   }
 
   // One cohesive brand colour for normal scores; the warm accent appears ONLY
@@ -88,7 +104,24 @@
     return BAR_BRAND;
   }
 
-  function render(p, cond, plan) {
+  // draw a set of {label:value} into a .bars container. `positive` keys are the
+  // ones where higher = better (Radiance, Clarity) so they never turn "warning".
+  function drawBars(container, entries, positive) {
+    container.innerHTML = "";
+    entries.forEach(([k, v]) => {
+      const isPos = positive && positive.has(k);
+      const color = isPos ? BAR_BRAND : barColor(k, v);
+      const el = document.createElement("div");
+      el.className = "bar-item";
+      el.innerHTML =
+        `<span>${k}</span>
+         <div class="bar-track"><div class="bar-fill" style="width:${v}%;background:${color}"></div></div>
+         <span class="bar-val">${v}</span>`;
+      container.appendChild(el);
+    });
+  }
+
+  function render(p, cond, plan, real) {
     $("empty").hidden = true; $("report").hidden = false;
 
     $("mType").textContent = p.type;
@@ -96,17 +129,22 @@
     $("toneChip").style.background = p.tone.hex;
     $("mUnder").textContent = p.undertone;
 
-    // bars
-    const bars = $("bars"); bars.innerHTML = "";
-    Object.entries(p.scores).forEach(([k, v]) => {
-      const el = document.createElement("div");
-      el.className = "bar-item";
-      el.innerHTML =
-        `<span>${k}</span>
-         <div class="bar-track"><div class="bar-fill" style="width:${v}%;background:${barColor(k, v)}"></div></div>
-         <span class="bar-val">${v}</span>`;
-      bars.appendChild(el);
-    });
+    // CV concern bars
+    drawBars($("bars"), Object.entries(p.scores), new Set(["Radiance"]));
+
+    // real-data face-level estimates (Clarity higher = better; Dark circles /
+    // Wrinkles higher = more concern). Hidden when the photo has too little skin.
+    if (real) {
+      drawBars($("realBars"),
+        [["Clarity", real.clarity], ["Dark circles", real.darkCircles], ["Wrinkles", real.wrinkles]],
+        new Set(["Clarity"]));
+      $("realBars").previousElementSibling.style.display = "";
+      $("realBars").style.display = "";
+    } else {
+      $("realBars").innerHTML = "";
+      $("realBars").style.display = "none";
+      $("realBars").previousElementSibling.style.display = "none";
+    }
 
     // condition
     const co = $("conditionOut");

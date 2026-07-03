@@ -76,19 +76,45 @@ signal (kept inside the skin gamut so mild acne no longer reads as clear) and a
 **synthetic baseline** — a brand replaces/augments it with real customer photos,
 which is the real moat.
 
+### Real-data face detectors (`js/real_models.js`)
+The condition screen is synthetic; the **Real-skin estimates** row is not. Three
+attribute detectors — **Clarity**, **Dark circles**, **Wrinkles** — are trained on
+**~4,900 real Indian-face photos** (5,000 sampled; grayscale / no-skin dropped)
+with human attribute labels. The pipeline is deliberately simple and honest:
+
+- A shared 16-d **face-level descriptor** (`js/face_features.js`) is computed over
+  the whole photo — skin fraction, Lab tone, oiliness/shine, global & upper-band
+  texture (wrinkles), an under-eye dark-band + chroma signal (dark circles), etc.
+  The **exact same function** runs at training time and inference time, so the
+  feature distribution can never drift between train and serve.
+- Per attribute, a **standardised, class-weighted logistic regression** (L2, full-
+  batch GD) is trained in-browser via `train/build.html` against a local `_ds/`
+  dataset. Only the learned weights ship in `js/real_models.js` — **never the
+  photos**. Inference stays 100% offline / pure-JS / no CDN.
+
+Held-out AUC on a ~970-image test split: **Clarity 0.71, Wrinkles 0.70, Dark
+circles 0.68** — honest, moderate signals surfaced as *estimates*, not diagnoses.
+Oiliness trained to ~0.57 AUC (≈ chance) so it stays the **direct CV specular
+measurement** in `skin_metrics.js` rather than a weak learned model. To retrain:
+open `train/build.html` against a local `_ds/` dataset and paste the new bundle.
+
 ## How it works
 
 ```
-photo ─▶ centre ROI (224²) ─┬─▶ SkinMetrics.analyse()  → tone, undertone, scores  (offline CV)
-                            └─▶ 24-d skin feature vector ─▶ KNN few-shot classifier → condition (ML)
-                                        │   (HSV histogram + CV metrics + Lab tone, all in-browser)
-                                        └─▶ Recommend.build() → ranked concerns → AM/PM routine → brand SKUs
+photo ─┬─ centre ROI (224²) ─┬─▶ SkinMetrics.analyse()  → tone, undertone, scores  (offline CV)
+       │                     └─▶ 24-d skin feature vector ─▶ KNN few-shot classifier → condition (ML)
+       │                                 │   (HSV histogram + CV metrics + Lab tone, all in-browser)
+       │                                 └─▶ Recommend.build() → ranked concerns → AM/PM routine → brand SKUs
+       └─ whole photo (160²) ──▶ FaceFeatures (16-d) ─▶ real logistic detectors → Clarity / Dark circles / Wrinkles
 ```
 
 | Piece | File | What |
 |---|---|---|
 | Skin CV metrics | `js/skin_metrics.js` | skin mask, Lab tone/undertone, oiliness/redness/pigment/texture/fungal-patch |
 | ML condition model | `js/classifier.js` | 24-d skin feature vector + trainable weighted KNN, saved to `localStorage` (100% offline, no CDN) |
+| Face-level features | `js/face_features.js` | 16-d whole-photo descriptor, shared by trainer + inference for train/serve parity |
+| Real-data detectors | `js/real_models.js` | logistic Clarity/Dark-circles/Wrinkles trained on ~4,900 real Indian faces (weights only) |
+| Detector trainer | `train/build.html` | dev-only in-browser trainer over a local `_ds/` dataset → paste-ready weight bundle |
 | D2C recommender | `js/recommend.js` | concern ranking + ingredient→brand-SKU routine, white-label catalog |
 | App / UI | `js/app.js`, `index.html`, `css/style.css` | camera, ROI, training UI, report |
 

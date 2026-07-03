@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<!--
+  build.html — DEV-ONLY trainer for the real-data attribute detectors.
+  Not shipped to end users. Run it against a local labelled dataset in
+  ../_ds/ (Images/ + labels.json), it extracts FaceFeatures over every photo,
+  trains a logistic-regression detector per attribute, prints held-out metrics,
+  and emits paste-ready weights for ../js/real_models.js. 100% in-browser so the
+  training features are byte-identical to the app's inference features.
+-->
+<html lang="en"><head><meta charset="UTF-8"><title>TwachaSense — real-model trainer</title>
+<style>body{font:14px monospace;background:#0f1115;color:#e8eaf0;padding:20px;line-height:1.5}
+pre{background:#181b22;padding:12px;border-radius:8px;overflow:auto;white-space:pre-wrap}</style>
+</head><body>
+<h2>TwachaSense real-model trainer</h2>
+<div id="status">loading…</div>
+<pre id="metrics"></pre>
+<h3>Paste into js/real_models.js</h3>
+<pre id="out"></pre>
+
+<script src="../js/skin_metrics.js"></script>
+<script src="../js/face_features.js"></script>
+<script>
+"use strict";
+const ATTRS = ["clear","oily","dark","wrinkle"];
+const S = (m)=>{document.getElementById("status").textContent=m;};
+window.__state = {phase:"init", done:0, total:0};
+window.__result = null;
+
+const DIM = FaceFeatures.FEATURE_NAMES.length;
+
+function loadImg(src){
+  return new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=src;});
+}
+
+async function extractAll(labels){
+  const ids = Object.keys(labels);
+  window.__state = {phase:"extract", done:0, total:ids.length};
+  const cv=document.createElement("canvas");cv.width=160;cv.height=160;
+  const ctx=cv.getContext("2d",{willReadFrequently:true});
+  const X=[], Y={}; ATTRS.forEach(a=>Y[a]=[]);
+  let skipped=0;
+  const CONC=10;
+  let idx=0;
+  async function worker(){
+    while(idx<ids.length){
+      const my=idx++; const id=ids[my];
+      try{
+        const im=await loadImg("../_ds/Images/"+id);
+        ctx.drawImage(im,0,0,160,160);
+        const f=FaceFeatures.extract(ctx.getImageData(0,0,160,160));
+        // skip grayscale / no-skin photos: they yield a neutral vector and only
+        // add label noise (the app also can't tone-analyse a B&W photo anyway).
+        if(!f.ok){ skipped++; }
+        else { X.push(f.vec); ATTRS.forEach(a=>Y[a].push(labels[id][a])); }
+      }catch(e){ /* skip unreadable */ }
+      if(my%200===0){window.__state.done=my; S("extracting features "+my+"/"+ids.length);}
+    }
+  }
+  await Promise.all(Array.from({length:CONC},worker));
+  window.__state.done=ids.length;
+  window.__skipped=skipped;
+  return {X,Y};
+}
+
+// standardise columns -> {Z, mean, std}
+function standardise(X){
+  const n=X.length, mean=new Array(DIM).fill(0), std=new Array(DIM).fill(0);
+  for(const r of X) for(let j=0;j<DIM;j++) mean[j]+=r[j];
+  for(let j=0;j<DIM;j++) mean[j]/=n;
+  for(const r of X) for(let j=0;j<DIM;j++){const dd=r[j]-mean[j];std[j]+=dd*dd;}
+  for(let j=0;j<DIM;j++) std[j]=Math.sqrt(std[j]/n)||1;
+  const Z=X.map(r=>r.map((v,j)=>(v-mean[j])/std[j]));
+  return {Z,mean,std};
+}
+
+function sigmoid(z){return 1/(1+Math.exp(-z));}
+
+// class-weighted logistic regression w/ L2, full-batch gradient descent
+function train(Z,y,{iters=400,lr=0.5,l2=1e-3}={}){
+  const n=Z.length, w=new Array(DIM).fill(0); let b=0;
+  const pos=y.reduce((s,v)=>s+v,0), neg=n-pos;
+  const wPos=neg/n*2, wNeg=pos/n*2;                 // balance imbalance
+  for(let it=0;it<iters;it++){
+    const gw=new Array(DIM).fill(0); let gb=0;
+    for(let i=0;i<n;i++){
+      let z=b; const zi=Z[i];
+      for(let j=0;j<DIM;j++) z+=w[j]*zi[j];
+      const p=sigmoid(z);
+      const cw = y[i]?wPos:wNeg;
+      const err=(p-y[i])*cw;
+      for(let j=0;j<DIM;j++) gw[j]+=err*zi[j];
+      gb+=err;
+    }
+    for(let j=0;j<DIM;j++){ w[j]-=lr*(gw[j]/n + l2*w[j]); }
+    b-=lr*(gb/n);
+  }
+  return {w,b};
+}
+
+function auc(scores,y){
+  const idx=scores.map((s,i)=>[s,y[i]]).sort((a,b)=>a[0]-b[0]);
+  let rankSum=0, pos=0, neg=0;
+  idx.forEach(([_,yy],i)=>{ if(yy){rankSum+=(i+1);pos++;} else neg++; });
+  if(!pos||!neg) return 0.5;
+  return (rankSum - pos*(pos+1)/2)/(pos*neg);
+}
+
+function evalModel(Z,y,m){
+  let tp=0,tn=0,fp=0,fn=0; const sc=[];
+  for(let i=0;i<Z.length;i++){
+    let z=m.b; for(let j=0;j<DIM;j++) z+=m.w[j]*Z[i][j];
+    const p=sigmoid(z); sc.push(p); const pred=p>=0.5?1:0;
+    if(pred&&y[i])tp++; else if(!pred&&!y[i])tn++; else if(pred&&!y[i])fp++; else fn++;
+  }
+  const acc=(tp+tn)/Z.length;
+  const bal=0.5*(tp/(tp+fn||1)+tn/(tn+fp||1));
+  return {acc:+acc.toFixed(3), bal:+bal.toFixed(3), auc:+auc(sc,y).toFixed(3), pos:tp+fn, n:Z.length};
+}
+
+async function run(){
+  S("fetching labels…");
+  const labels=await fetch("../_ds/labels.json").then(r=>r.json());
+  const {X,Y}=await extractAll(labels);
+  window.__state={phase:"train",done:0,total:ATTRS.length};
+  S("training…");
+  // fixed 80/20 split (deterministic)
+  const n=X.length, nTr=(n*0.8)|0;
+  const {Z,mean,std}=standardise(X);
+  const Ztr=Z.slice(0,nTr), Zte=Z.slice(nTr);
+  const models={}, metrics={};
+  ATTRS.forEach((a,ai)=>{
+    const ytr=Y[a].slice(0,nTr), yte=Y[a].slice(nTr);
+    const m=train(Ztr,ytr);
+    models[a]={w:m.w.map(v=>+v.toFixed(4)),b:+m.b.toFixed(4)};
+    metrics[a]={train:evalModel(Ztr,ytr,m), test:evalModel(Zte,yte,m)};
+    window.__state.done=ai+1;
+  });
+  const bundle={ names:FaceFeatures.FEATURE_NAMES, mean:mean.map(v=>+v.toFixed(4)),
+                 std:std.map(v=>+v.toFixed(4)), models, trainedOn:n, date:new Date().toISOString().slice(0,10) };
+  window.__result={metrics, bundle};
+  window.__state.phase="done";
+  document.getElementById("metrics").textContent=JSON.stringify(metrics,null,2);
+  document.getElementById("out").textContent=
+    "window.RealModels = "+JSON.stringify(bundle)+";";
+  S("done — trained on "+n+" images.");
+}
+run().catch(e=>{S("ERROR: "+e.message);window.__state={phase:"error",msg:e.message};});
+</script>
+</body></html>
