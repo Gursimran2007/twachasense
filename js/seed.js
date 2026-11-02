@@ -147,7 +147,9 @@
         for (const cond of conditions) {
           const base = sampleTone(rng);
           const sev = 0.5 + rng() * 0.5;         // mild → severe coverage
-          Classifier.addExample(makePatch(base, cond, rng, sev), IDX[cond]);
+          // tagged "seed": a synthetic prior may inform, but never override,
+          // the shipped real-derm model (only REAL brand photos may do that)
+          Classifier.addExample(makePatch(base, cond, rng, sev), IDX[cond], "seed");
           done++;
           onProgress && onProgress(done, total);
         }

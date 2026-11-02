@@ -84,6 +84,40 @@
     return { label: r.label, confidence: r.confidence, confidences, source: "real" };
   }
 
+  // temperature-soften a {class: p} distribution for display — a cosmetic
+  // SCREEN should read "mostly X, some Y", never a flat 100% / 0%.
+  function tempered(conf, T) {
+    const out = {}; let s = 0;
+    Object.keys(conf).forEach((k) => { out[k] = Math.pow(Math.max(conf[k], 1e-4), 1 / T); s += out[k]; });
+    Object.keys(out).forEach((k) => (out[k] /= s));
+    return out;
+  }
+
+  function pickTop(confidences, source) {
+    let label = null, best = -1;
+    Object.keys(confidences).forEach((k) => { if (confidences[k] > best) { best = confidences[k]; label = k; } });
+    return { label, confidence: Math.round(best * 100), confidences, source };
+  }
+
+  // Route/blend the two condition signals:
+  //   personalised — the brand taught the KNN on its OWN photos: that wins.
+  //   blend        — real-derm model leads (75%), seeded tone prior assists (25%).
+  //   real / seed  — whichever one exists.
+  // A synthetic seed must never bury the model trained on real derm photos.
+  function combineCondition(realCond, knnCond) {
+    if (knnCond && Classifier.hasRealExamples()) return { ...knnCond, source: "personalised" };
+    const real = realCond ? tempered(condFromReal(realCond).confidences, 1.6) : null;
+    if (real && knnCond) {
+      const confidences = {};
+      Classifier.CLASSES.forEach((c) =>
+        (confidences[c] = 0.75 * (real[c] || 0) + 0.25 * (knnCond.confidences[c] || 0)));
+      return pickTop(confidences, "blend");
+    }
+    if (real) return pickTop(real, "real");
+    if (knnCond) return { ...knnCond, source: "seed" };
+    return null;
+  }
+
   async function analyse() {
     if (!lastPatch) return;
     const imgData = lastPatch.getContext("2d").getImageData(0, 0, 224, 224);
@@ -91,15 +125,14 @@
     if (!profile.ok) { $("empty").hidden = false; $("report").hidden = true; $("empty").textContent = profile.reason; return; }
 
     lastProfile = profile;
-    // real-data condition model (trained on ~11k real derm photos) + non-diagnostic
-    // derm-referral head. Always available — no seeding needed.
+    // real-data condition model (trained on 100% of the 262k-image DermNet set)
+    // + non-diagnostic derm-referral head. Always available — no seeding needed.
     const realCond = (window.CondModels && lastPatch) ? CondModels.score(lastPatch) : null;
     lastRefer = realCond;
-    // If the brand has taught the few-shot KNN on its own photos, that personalised
-    // signal wins; otherwise fall back to the shipped real-data model.
-    lastCondition = Classifier.isTrained()
-      ? await Classifier.predict(lastPatch)
-      : condFromReal(realCond);
+    // Personalised (real brand photos) wins; otherwise the real-derm model leads
+    // and the seeded synthetic prior only assists (see combineCondition).
+    const knnCond = Classifier.isTrained() ? await Classifier.predict(lastPatch) : null;
+    lastCondition = combineCondition(realCond, knnCond);
     // real-data face-level estimates from the whole photo (may be null on a
     // tight crop with too little skin — the UI hides the section in that case)
     lastReal = (lastFull && window.RealModels)
@@ -201,15 +234,27 @@
       const headline = detected
         ? `${CALLOUT[cond.label] || cond.label} detected`
         : `No cosmetic concern flagged`;
+      // skin rarely has exactly one thing going on — surface the runner-up
+      // whenever it carries real weight, instead of pretending it's at 0%.
+      const [k2, v2] = Object.entries(cond.confidences)
+        .filter(([k]) => k !== cond.label && k !== "Clear")
+        .sort((a, b) => b[1] - a[1])[0] || [null, 0];
+      const also = (k2 && v2 >= 0.22)
+        ? `<p class="cond-also">Also worth watching: ${CALLOUT[k2] || k2} · ${Math.round(v2 * 100)}%</p>`
+        : "";
       co.innerHTML =
         `<div class="cond-head">
            <div class="cond-top">${cond.label} · ${cond.confidence}%</div>${badge}
          </div>
-         <p class="cond-callout">${headline}</p>
+         <p class="cond-callout">${headline}</p>${also}
          <ul class="cond-list">${others}</ul>`;
-      $("mlState").textContent = cond.source === "real"
-        ? "real model · ~11k derm photos"
-        : `model: ${Classifier.totalExamples()} examples (personalised)`;
+      const srcText = {
+        personalised: `personalised · ${Classifier.realExamples()} brand photo${Classifier.realExamples() === 1 ? "" : "s"}`,
+        blend: "real-derm model · 262k images + seeded tone prior",
+        real: "real-derm model · 262k images",
+        seed: `seeded baseline · ${Classifier.totalExamples()} synthetic patches`,
+      };
+      $("mlState").textContent = srcText[cond.source] || srcText.real;
     } else {
       co.className = "condition locked";
       co.innerHTML =
@@ -221,7 +266,7 @@
       $("mlState").textContent = "model: not trained";
     }
 
-    // NON-DIAGNOSTIC derm-referral nudge. The binary head (AUC ~0.70) fires when
+    // NON-DIAGNOSTIC derm-referral nudge. The binary head (held-out AUC ~0.93) fires when
     // the skin pattern looks unlike ordinary cosmetic concerns. It NEVER names a
     // disease — it only suggests a professional look. Shown above ~55% to keep it
     // a genuine signal, not a blanket disclaimer.

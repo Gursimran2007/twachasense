@@ -61,6 +61,7 @@
     let n = 0;
     let sumL = 0, sumA = 0, sumB = 0;
     let sumR = 0, sumG = 0, sumBl = 0;
+    const skinL = [];         // per-skin-pixel L* → robust (trimmed) tone estimate
     let sumSat = 0;           // mean skin saturation (for fungal-patch detection)
     let redEx = 0;            // erythema (redness) accumulator
     let shine = 0;            // specular highlight pixels
@@ -78,6 +79,7 @@
         n++;
         const lab = rgb2lab(r, g, b);
         sumL += lab.L; sumA += lab.a; sumB += lab.b;
+        skinL.push(lab.L);
         sumR += r; sumG += g; sumBl += b;
         // accumulate baseline redness (r-g) so redness can be measured RELATIVE
         // to the person's own tone — warm Indian skin must not read as "inflamed"
@@ -157,13 +159,22 @@
     else if (dryness > 0.5) type = "Dry";
     else type = "Normal / balanced";
 
-    const monk = monkFromL(meanL);
+    // Tone is mapped from a TRIMMED-mean L* rather than the raw mean: specular
+    // shine and shadow/hair pixels vary shot-to-shot and are what make the Monk
+    // number jump between captures of the same face. Dropping the brightest and
+    // darkest 15% of skin pixels yields a stable, illumination-robust lightness.
+    skinL.sort((p, q) => p - q);
+    const cut = Math.floor(skinL.length * 0.15);
+    let trimSum = 0, trimN = 0;
+    for (let i = cut; i < skinL.length - cut; i++) { trimSum += skinL[i]; trimN++; }
+    const toneL = trimN ? trimSum / trimN : meanL;
+    const monk = monkFromL(toneL);
 
     return {
       ok: true,
       skinPixels: n,
       type,
-      tone: { monk: monk.n, hex: monk.hex, L: Math.round(meanL) },
+      tone: { monk: monk.n, hex: monk.hex, L: Math.round(toneL) },
       undertone,
       // scores 0..100
       scores: {

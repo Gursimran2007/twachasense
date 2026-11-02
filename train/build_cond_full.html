@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<!--
+  build_cond_full.html — DEV-ONLY sharded trainer covering the WHOLE 262k-image
+  DermNet balanced_dataset. Identical crop (grabPatch) + training math as
+  build_cond.html, but features are accumulated across disk-bounded shards
+  (../_ds_cond/shard/, replaced per shard by _shard_extract.py) so the full set
+  is covered without ever holding it all on disk. Weights only are emitted.
+
+  Driven from outside via:
+    window.startShard()  -> begins feature-extracting ../_ds_cond/shard/, returns
+                            immediately; sets window.__shardBusy=false when done.
+    window.finalize(so,ro) -> standardise on accumulated TRAIN, train both heads,
+                            eval on held-out TEST, store window.__result.
+  Progress in window.__state; accumulators in window.__acc.
+-->
+<html lang="en"><head><meta charset="UTF-8"><title>TwachaSense — full sharded trainer</title>
+<style>body{font:14px monospace;background:#0f1115;color:#e8eaf0;padding:20px;line-height:1.5}
+pre{background:#181b22;padding:12px;border-radius:8px;overflow:auto;white-space:pre-wrap}</style>
+</head><body>
+<h2>TwachaSense full (sharded) condition + referral trainer</h2>
+<div id="status">idle — drive via window.startShard() / window.finalize()</div>
+<pre id="metrics"></pre>
+<h3>Paste into js/cond_models.js</h3>
+<pre id="out"></pre>
+
+<script src="../js/skin_metrics.js?v=cond2"></script>
+<script src="../js/cond_features.js?v=cond5"></script>
+<script>
+"use strict";
+const S=(m)=>{document.getElementById("status").textContent=m;};
+const COS=["Clear","Acne","Fungal","Eczema","Pigmentation","Dryness"];
+const NC=COS.length;
+let DIM=0;
+
+// accumulators across shards (raw 49-d features + labels, tiny)
+window.__acc={trX:[],trCos:[],trRef:[],teX:[],teCos:[],teRef:[]};
+window.__state={phase:"idle",shard:-1,done:0,total:0,seen:0,skipped:0};
+window.__shardBusy=false;
+window.__result=null;
+
+function loadImg(src){return new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=src;});}
+
+// replicate app.js grabPatch(): centred 46%-of-min-dimension crop -> 224².
+function grabPatch(im){
+  const sw=im.naturalWidth, sh=im.naturalHeight;
+  const size=Math.min(sw,sh)*0.46, sx=(sw-size)/2, sy=(sh-size)/2;
+  const c=document.createElement("canvas"); c.width=224; c.height=224;
+  c.getContext("2d",{willReadFrequently:true}).drawImage(im,sx,sy,size,size,0,0,224,224);
+  return c;
+}
+
+// feature-extract ONE shard dir, append into the accumulators (SAME as inference)
+async function processShard(){
+  const A=window.__acc;
+  const man=await fetch("../_ds_cond/shard/manifest.json?_="+Date.now()).then(r=>r.json());
+  const items=man.items;
+  window.__state.phase="shard"; window.__state.shard=man.shard;
+  window.__state.done=0; window.__state.total=items.length;
+  let idx=0; const CONC=8;
+  async function worker(){
+    while(idx<items.length){
+      const my=idx++, it=items[my];
+      try{
+        const im=await loadImg("../_ds_cond/shard/"+it.path);
+        const c=grabPatch(im);
+        const f=CondFeatures.extract(c.getContext("2d").getImageData(0,0,224,224));
+        if(!f.ok){ window.__state.skipped++; }
+        else if(it.split==="test"){ A.teX.push(f.vec); A.teCos.push(it.cos); A.teRef.push(it.refer); }
+        else { A.trX.push(f.vec); A.trCos.push(it.cos); A.trRef.push(it.refer); }
+      }catch(e){ /* unreadable */ }
+      window.__state.seen++;
+      if(my%200===0){window.__state.done=my;S("shard "+man.shard+" — "+my+"/"+items.length+"  (train "+A.trX.length+" / test "+A.teX.length+")");}
+    }
+  }
+  await Promise.all(Array.from({length:CONC},worker));
+  window.__state.done=items.length;
+  S("shard "+man.shard+" done — accumulated train "+A.trX.length+" / test "+A.teX.length+" (skipped "+window.__state.skipped+")");
+}
+// fire-and-forget wrapper so the driver can poll __shardBusy instead of awaiting
+window.startShard=function(){
+  window.__shardBusy=true;
+  processShard().catch(e=>{S("SHARD ERROR: "+e.message);console.error(e);})
+                .finally(()=>{window.__shardBusy=false;});
+  return "started";
+};
+
+function standardise(X){
+  const n=X.length,mean=new Array(DIM).fill(0),std=new Array(DIM).fill(0);
+  for(const r of X)for(let j=0;j<DIM;j++)mean[j]+=r[j];
+  for(let j=0;j<DIM;j++)mean[j]/=n;
+  for(const r of X)for(let j=0;j<DIM;j++){const d=r[j]-mean[j];std[j]+=d*d;}
+  for(let j=0;j<DIM;j++)std[j]=Math.sqrt(std[j]/n)||1;
+  const Z=X.map(r=>r.map((v,j)=>(v-mean[j])/std[j]));
+  return {Z,mean,std};
+}
+function sigmoid(z){return 1/(1+Math.exp(-z));}
+function rng(seed){let s=seed>>>0;return()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};}
+
+// ---- binary MLP (referral head): DIM -> HID tanh -> sigmoid ----------------
+function trainBin(Z,y,{HID=12,epochs=25,lr=0.6,l2=6e-4,batch=256,seed=7}={}){
+  const n=Z.length, rnd=rng(seed), sc=Math.sqrt(2/DIM);
+  const W1=Array.from({length:HID},()=>Array.from({length:DIM},()=>(rnd()*2-1)*sc));
+  const b1=new Array(HID).fill(0);
+  const W2=Array.from({length:HID},()=>(rnd()*2-1)*Math.sqrt(1/HID)); let b2=0;
+  const pos=y.reduce((a,v)=>a+v,0),neg=n-pos,wPos=neg/n*2,wNeg=pos/n*2,h=new Array(HID);
+  const order=Array.from({length:n},(_,i)=>i);
+  for(let ep=0;ep<epochs;ep++){
+    for(let i=n-1;i>0;i--){const j=(rnd()*(i+1))|0;[order[i],order[j]]=[order[j],order[i]];}
+    for(let lo=0;lo<n;lo+=batch){
+      const hi=Math.min(n,lo+batch),m=hi-lo;
+      const gW1=Array.from({length:HID},()=>new Array(DIM).fill(0)),gb1=new Array(HID).fill(0),gW2=new Array(HID).fill(0);let gb2=0;
+      for(let t=lo;t<hi;t++){
+        const i=order[t],xi=Z[i];let z2=b2;
+        for(let k=0;k<HID;k++){let a=b1[k];const w=W1[k];for(let j=0;j<DIM;j++)a+=w[j]*xi[j];h[k]=Math.tanh(a);z2+=W2[k]*h[k];}
+        const p=sigmoid(z2),cw=y[i]?wPos:wNeg,dz=(p-y[i])*cw;gb2+=dz;
+        for(let k=0;k<HID;k++){gW2[k]+=dz*h[k];const dh=dz*W2[k]*(1-h[k]*h[k]);gb1[k]+=dh;const g=gW1[k];for(let j=0;j<DIM;j++)g[j]+=dh*xi[j];}
+      }
+      for(let k=0;k<HID;k++){W2[k]-=lr*(gW2[k]/m+l2*W2[k]);b1[k]-=lr*(gb1[k]/m);const W=W1[k],g=gW1[k];for(let j=0;j<DIM;j++)W[j]-=lr*(g[j]/m+l2*W[j]);}
+      b2-=lr*(gb2/m);
+    }
+  }
+  return {W1,b1,W2,b2};
+}
+function binProb(m,x){let z2=m.b2;for(let k=0;k<m.W1.length;k++){let a=m.b1[k];const w=m.W1[k];for(let j=0;j<x.length;j++)a+=w[j]*x[j];z2+=m.W2[k]*Math.tanh(a);}return sigmoid(z2);}
+
+// ---- softmax MLP (cosmetic head): DIM -> HID tanh -> NC softmax ------------
+function trainSoft(Z,y,{HID=16,epochs=40,lr=0.5,l2=8e-4,batch=256,seed=11}={}){
+  const n=Z.length,rnd=rng(seed),sc=Math.sqrt(2/DIM);
+  const W1=Array.from({length:HID},()=>Array.from({length:DIM},()=>(rnd()*2-1)*sc)),b1=new Array(HID).fill(0);
+  const W2=Array.from({length:NC},()=>Array.from({length:HID},()=>(rnd()*2-1)*Math.sqrt(1/HID))),b2=new Array(NC).fill(0);
+  const cnt=new Array(NC).fill(0);y.forEach(c=>cnt[c]++);
+  const cw=cnt.map(c=>c>0?n/(NC*c):0);
+  const h=new Array(HID),logit=new Array(NC),order=Array.from({length:n},(_,i)=>i);
+  for(let ep=0;ep<epochs;ep++){
+    for(let i=n-1;i>0;i--){const j=(rnd()*(i+1))|0;[order[i],order[j]]=[order[j],order[i]];}
+    for(let lo=0;lo<n;lo+=batch){
+      const hi=Math.min(n,lo+batch),m=hi-lo;
+      const gW1=Array.from({length:HID},()=>new Array(DIM).fill(0)),gb1=new Array(HID).fill(0);
+      const gW2=Array.from({length:NC},()=>new Array(HID).fill(0)),gb2=new Array(NC).fill(0);
+      for(let t=lo;t<hi;t++){
+        const i=order[t],xi=Z[i];
+        for(let k=0;k<HID;k++){let a=b1[k];const w=W1[k];for(let j=0;j<DIM;j++)a+=w[j]*xi[j];h[k]=Math.tanh(a);}
+        let mx=-1e9;for(let c=0;c<NC;c++){let z=b2[c];const w=W2[c];for(let k=0;k<HID;k++)z+=w[k]*h[k];logit[c]=z;if(z>mx)mx=z;}
+        let sum=0;for(let c=0;c<NC;c++){logit[c]=Math.exp(logit[c]-mx);sum+=logit[c];}
+        const w=cw[y[i]];
+        const dh=new Array(HID).fill(0);
+        for(let c=0;c<NC;c++){
+          const p=logit[c]/sum,dz=(p-(c===y[i]?1:0))*w;
+          gb2[c]+=dz;const g=gW2[c],W=W2[c];
+          for(let k=0;k<HID;k++){g[k]+=dz*h[k];dh[k]+=dz*W[k];}
+        }
+        for(let k=0;k<HID;k++){const dpre=dh[k]*(1-h[k]*h[k]);gb1[k]+=dpre;const g=gW1[k];for(let j=0;j<DIM;j++)g[j]+=dpre*xi[j];}
+      }
+      for(let c=0;c<NC;c++){b2[c]-=lr*(gb2[c]/m);const W=W2[c],g=gW2[c];for(let k=0;k<HID;k++)W[k]-=lr*(g[k]/m+l2*W[k]);}
+      for(let k=0;k<HID;k++){b1[k]-=lr*(gb1[k]/m);const W=W1[k],g=gW1[k];for(let j=0;j<DIM;j++)W[j]-=lr*(g[j]/m+l2*W[j]);}
+    }
+  }
+  return {W1,b1,W2,b2};
+}
+function softProbs(m,x){
+  const HID=m.W1.length,h=new Array(HID);
+  for(let k=0;k<HID;k++){let a=m.b1[k];const w=m.W1[k];for(let j=0;j<x.length;j++)a+=w[j]*x[j];h[k]=Math.tanh(a);}
+  const lo=new Array(NC);let mx=-1e9;for(let c=0;c<NC;c++){let z=m.b2[c];const w=m.W2[c];for(let k=0;k<HID;k++)z+=w[k]*h[k];lo[c]=z;if(z>mx)mx=z;}
+  let s=0;for(let c=0;c<NC;c++){lo[c]=Math.exp(lo[c]-mx);s+=lo[c];}return lo.map(v=>v/s);
+}
+function auc(sc,y){const idx=sc.map((s,i)=>[s,y[i]]).sort((a,b)=>a[0]-b[0]);let rs=0,p=0,ng=0;idx.forEach(([_,yy],i)=>{if(yy){rs+=i+1;p++;}else ng++;});return(!p||!ng)?0.5:(rs-p*(p+1)/2)/(p*ng);}
+
+function evalSoft(Z,y,m){
+  const conf=Array.from({length:NC},()=>new Array(NC).fill(0));let correct=0;
+  for(let i=0;i<Z.length;i++){const pr=softProbs(m,Z[i]);let a=0;for(let c=1;c<NC;c++)if(pr[c]>pr[a])a=c;conf[y[i]][a]++;if(a===y[i])correct++;}
+  const perClass=conf.map((row,c)=>{const tot=row.reduce((s,v)=>s+v,0);return tot?+(row[c]/tot).toFixed(3):0;});
+  const bal=+(perClass.reduce((s,v)=>s+v,0)/NC).toFixed(3);
+  return {acc:+(correct/Z.length).toFixed(3),bal,perClass,n:Z.length};
+}
+function evalBin(Z,y,m){let tp=0,tn=0,fp=0,fn=0;const sc=[];for(let i=0;i<Z.length;i++){const p=binProb(m,Z[i]);sc.push(p);const pr=p>=0.5?1:0;if(pr&&y[i])tp++;else if(!pr&&!y[i])tn++;else if(pr&&!y[i])fp++;else fn++;}
+  return {acc:+((tp+tn)/Z.length).toFixed(3),recall:+(tp/(tp+fn||1)).toFixed(3),spec:+(tn/(tn+fp||1)).toFixed(3),auc:+auc(sc,y).toFixed(3),n:Z.length};}
+
+const r4=v=>+v.toFixed(4);
+function packBin(m){return{W1:m.W1.map(r=>r.map(r4)),b1:m.b1.map(r4),W2:m.W2.map(r4),b2:r4(m.b2)};}
+function packSoft(m){return{W1:m.W1.map(r=>r.map(r4)),b1:m.b1.map(r4),W2:m.W2.map(r=>r.map(r4)),b2:m.b2.map(r4)};}
+
+// standardise on accumulated TRAIN, train both heads, eval on TEST, build bundle
+window.finalize=function(softOpts,binOpts){
+  const A=window.__acc;
+  DIM=A.trX.length?A.trX[0].length:0;
+  window.__state.phase="train";S("standardising "+A.trX.length+" train / "+A.teX.length+" test…");
+  const {Z,mean,std}=standardise(A.trX);
+  const Zte=A.teX.map(r=>r.map((v,j)=>(v-mean[j])/std[j]));
+
+  const ci=[];A.trCos.forEach((c,i)=>{if(c>=0)ci.push(i);});
+  const Zc=ci.map(i=>Z[i]),yc=ci.map(i=>A.trCos[i]);
+  const cti=[];A.teCos.forEach((c,i)=>{if(c>=0)cti.push(i);});
+  const Zct=cti.map(i=>Zte[i]),yct=cti.map(i=>A.teCos[i]);
+
+  const ri=[];A.trRef.forEach((r,i)=>{if(r>=0)ri.push(i);});
+  const Zr=ri.map(i=>Z[i]),yr=ri.map(i=>A.trRef[i]);
+  const rti=[];A.teRef.forEach((r,i)=>{if(r>=0)rti.push(i);});
+  const Zrt=rti.map(i=>Zte[i]),yrt=rti.map(i=>A.teRef[i]);
+
+  S("training cosmetic softmax…");
+  const soft=trainSoft(Zc,yc,softOpts||{});
+  S("training referral head…");
+  const refer=trainBin(Zr,yr,binOpts||{});
+
+  const metrics={cosmetic:{train:evalSoft(Zc,yc,soft),test:evalSoft(Zct,yct,soft),classes:COS},
+                 refer:{train:evalBin(Zr,yr,refer),test:evalBin(Zrt,yrt,refer)},
+                 skipped:window.__state.skipped, trainN:A.trX.length, testN:A.teX.length};
+  const bundle={arch:"mlp",classes:COS,mean:mean.map(r4),std:std.map(r4),
+                cosmetic:packSoft(soft),refer:packBin(refer),
+                trainedOn:Zc.length,date:new Date().toISOString().slice(0,10),metrics};
+  window.__result={metrics,bundle};window.__state.phase="done";
+  document.getElementById("metrics").textContent=JSON.stringify(metrics,null,2);
+  document.getElementById("out").textContent="const BUNDLE = "+JSON.stringify(bundle)+";";
+  S("done — cosmetic "+metrics.cosmetic.test.bal+" bal-acc, referral "+metrics.refer.test.auc+" AUC.");
+
+  // keep standardised data for tuning without re-extracting
+  window.__data={Zc,yc,Zct,yct,Zr,yr,Zrt,yrt,mean,std,trainN:A.trX.length};
+  window.retrainSoft=(opts)=>{const m=trainSoft(Zc,yc,opts);return{train:evalSoft(Zc,yc,m),test:evalSoft(Zct,yct,m)};};
+  window.retrainBin=(opts)=>{const m=trainBin(Zr,yr,opts);return{train:evalBin(Zr,yr,m),test:evalBin(Zrt,yrt,m)};};
+  window.buildBundle=(so,ro)=>{const s2=trainSoft(Zc,yc,so),r2=trainBin(Zr,yr,ro);
+    return{arch:"mlp",classes:COS,mean:mean.map(r4),std:std.map(r4),
+      cosmetic:packSoft(s2),refer:packBin(r2),trainedOn:Zc.length,
+      date:new Date().toISOString().slice(0,10),
+      metrics:{cosmetic:{train:evalSoft(Zc,yc,s2),test:evalSoft(Zct,yct,s2)},
+               refer:{train:evalBin(Zr,yr,r2),test:evalBin(Zrt,yrt,r2)}}};};
+  return metrics;
+};
+S("ready — drive via window.startShard() per shard, then window.finalize().");
+</script>
+</body></html>

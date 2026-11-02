@@ -10,6 +10,11 @@
  *
  * That "few-shot on your own data, no cloud" loop is the moat. Scale path: swap
  * this vector for a brand-trained CNN's embedding — the interface is unchanged.
+ *
+ * Predictions are CALIBRATED: label smoothing + out-of-distribution flattening,
+ * so a unanimous 7-neighbour vote reads as strong evidence, never 100%/0%.
+ * Each example carries an origin tag ("real" brand photo vs synthetic "seed");
+ * only real brand photos may override the shipped real-derm model (app.js).
  */
 (function (global) {
   "use strict";
@@ -30,8 +35,9 @@
     2.6,                          // fungalPatch (light desaturated patch)
   ];
 
-  let examples = [];   // [{label, vec:[...]}]
+  let examples = [];   // [{label, vec:[...], origin:"seed"|"real"}]
   let ready = false;
+  let scaleCache = null; // typical nearest-neighbour distance (calibration ref)
 
   async function init(onState) {
     loadFromStorage();
@@ -98,12 +104,40 @@
   }
 
   // ---- KNN api (same signatures the app already calls) ---------------------
-  function addExample(canvas, classIdx) {
+  // origin: "real" = a brand's own labelled photo (the personalisation moat),
+  // "seed" = the synthetic tone prior. The app routes on this: only REAL brand
+  // photos may override the shipped real-derm model.
+  function addExample(canvas, classIdx, origin) {
     if (!ready) return false;
-    examples.push({ label: CLASSES[classIdx], vec: featurize(canvas) });
+    examples.push({ label: CLASSES[classIdx], vec: featurize(canvas), origin: origin || "real" });
+    scaleCache = null;
     saveToStorage();
     return true;
   }
+
+  // Typical nearest-neighbour distance inside the training set (median over a
+  // sample). Used as the calibration reference: a query whose nearest neighbour
+  // sits far beyond this is out-of-distribution and must NOT be confident.
+  function refScale() {
+    if (scaleCache != null) return scaleCache;
+    const N = examples.length;
+    if (N < 8) return (scaleCache = 1);
+    const S = Math.min(160, N), step = Math.max(1, Math.floor(N / S));
+    const ds = [];
+    for (let i = 0; i < N; i += step) {
+      let best = Infinity;
+      for (let j = 0; j < N; j++) {
+        if (j === i) continue;
+        const d = dist2(examples[i].vec, examples[j].vec);
+        if (d < best) best = d;
+      }
+      ds.push(Math.sqrt(best));
+    }
+    ds.sort((a, b) => a - b);
+    return (scaleCache = ds[Math.floor(ds.length / 2)] || 1);
+  }
+
+  const SMOOTH = 0.15; // label smoothing floor -> max confidence ~87%, never 100/0
 
   function predict(canvas) {
     if (!ready || examples.length === 0) return null;
@@ -120,10 +154,21 @@
 
     const confidences = {};
     CLASSES.forEach((c) => (confidences[c] = wsum > 0 ? weight[c] / wsum : 0));
+
+    // ---- calibration (fixes the 100%-one-class / 0%-everything-else collapse)
+    // 1. reliability: how in-distribution is this query? 1 when its nearest
+    //    neighbour is within the typical NN distance, decaying beyond it.
+    // 2. smoothing: mix toward uniform — a 7-0 neighbour vote is evidence,
+    //    not certainty. Far queries flatten hard toward "don't know".
+    const D0 = refScale();
+    const rel = Math.exp(-Math.max(0, scored[0].d - D0) / (D0 || 1));
+    const lam = 1 - (1 - SMOOTH) * rel;
+    CLASSES.forEach((c) => (confidences[c] = (1 - lam) * confidences[c] + lam / CLASSES.length));
+
     let label = CLASSES[0], best = -1;
     CLASSES.forEach((c) => { if (confidences[c] > best) { best = confidences[c]; label = c; } });
 
-    return { label, confidence: Math.round(best * 100), confidences };
+    return { label, confidence: Math.round(best * 100), confidences, reliability: rel };
   }
 
   function counts() {
@@ -132,7 +177,11 @@
     return out;
   }
   function totalExamples() { return examples.length; }
+  function realExamples() { return examples.reduce((n, e) => n + (e.origin === "real" ? 1 : 0), 0); }
   function isTrained() { return ready && examples.length > 0; }
+  // true only when the brand has taught it on its OWN photos — the only case
+  // where this KNN is allowed to override the shipped real-derm model.
+  function hasRealExamples() { return ready && realExamples() > 0; }
 
   // ---- persistence ---------------------------------------------------------
   function saveToStorage() {
@@ -140,13 +189,21 @@
     catch (e) { console.warn("save failed", e); }
   }
   function loadFromStorage() {
-    try { const raw = localStorage.getItem(STORE_KEY); if (raw) examples = JSON.parse(raw); }
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (raw) examples = JSON.parse(raw);
+      // examples stored before origin-tagging existed are of unknown provenance —
+      // treat them as "seed" so data we can't vouch for never outranks the
+      // shipped real-derm model. New brand photos get tagged "real" on add.
+      examples.forEach((e) => { if (!e.origin) e.origin = "seed"; });
+    }
     catch (e) { console.warn("load failed", e); examples = []; }
+    scaleCache = null;
   }
-  function reset() { examples = []; localStorage.removeItem(STORE_KEY); }
+  function reset() { examples = []; scaleCache = null; localStorage.removeItem(STORE_KEY); }
 
   global.Classifier = {
-    CLASSES, init, addExample, predict, counts, totalExamples,
-    isTrained, reset, featurize, get ready() { return ready; },
+    CLASSES, init, addExample, predict, counts, totalExamples, realExamples,
+    isTrained, hasRealExamples, reset, featurize, get ready() { return ready; },
   };
 })(window);

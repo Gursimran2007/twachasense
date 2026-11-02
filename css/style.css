@@ -156,6 +156,7 @@ footer{
 .cond-badge.sev-low{background:rgba(124,156,255,.16);color:#a5b4ff;border:1px solid #7c9cff55}
 .cond-badge.clear{background:rgba(74,222,128,.14);color:#4ade80;border:1px solid #4ade8055}
 .cond-callout{margin:8px 0 4px;font-size:14px;font-weight:600;color:var(--txt)}
+.cond-also{margin:2px 0 4px;font-size:13px;font-weight:600;color:#fbbf24}
 
 /* ---- connect-a-brand panel ---- */
 .panel.connect{grid-column:1 / -1}
